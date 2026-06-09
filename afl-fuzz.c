@@ -535,6 +535,13 @@ static aco_transition_t *aco_get_transition(u32 from, u32 to) {
   return &aco_transitions[idx];
 }
 
+static u8 aco_state_selectable(u32 state_id) {
+  khint_t k = kh_get(hms, khms_states, state_id);
+
+  if (k == kh_end(khms_states)) return 0;
+  return kh_val(khms_states, k)->seeds_count > 0;
+}
+
 static void aco_refresh_transition_depth(aco_transition_t *transition) {
   khint_t k;
   state_info_t *to_state;
@@ -619,7 +626,7 @@ static u32 aco_choose_edge(u32 from_state, u8 use_from_filter) {
   weights = (double *)ck_alloc(aco_transition_count * sizeof(double));
 
   for (i = 0; i < aco_transition_count; i++) {
-    if (use_from_filter && aco_transitions[i].from != from_state) {
+    if ((use_from_filter && aco_transitions[i].from != from_state) || !aco_state_selectable(aco_transitions[i].to)) {
       weights[i] = 0.0;
       continue;
     }
@@ -660,14 +667,14 @@ static u32 aco_pick_random_edge(u32 from_state, u8 use_from_filter) {
   u32 i, eligible = 0, pick;
 
   for (i = 0; i < aco_transition_count; i++) {
-    if (!use_from_filter || aco_transitions[i].from == from_state) eligible++;
+    if ((!use_from_filter || aco_transitions[i].from == from_state) && aco_state_selectable(aco_transitions[i].to)) eligible++;
   }
 
   if (!eligible) return aco_transition_count;
 
   pick = UR(eligible);
   for (i = 0; i < aco_transition_count; i++) {
-    if (!use_from_filter || aco_transitions[i].from == from_state) {
+    if ((!use_from_filter || aco_transitions[i].from == from_state) && aco_state_selectable(aco_transitions[i].to)) {
       if (pick == 0) return i;
       pick--;
     }
@@ -677,9 +684,28 @@ static u32 aco_pick_random_edge(u32 from_state, u8 use_from_filter) {
 }
 
 static u32 aco_fallback_state(void) {
+  u32 i, eligible = 0, pick;
+
   if (state_ids_count == 0) return 0;
-  selected_state_index = UR(state_ids_count);
-  return state_ids[selected_state_index];
+
+  for (i = 0; i < state_ids_count; i++) {
+    if (aco_state_selectable(state_ids[i])) eligible++;
+  }
+
+  if (!eligible) return 0;
+
+  pick = UR(eligible);
+  for (i = 0; i < state_ids_count; i++) {
+    if (aco_state_selectable(state_ids[i])) {
+      if (pick == 0) {
+        selected_state_index = i;
+        return state_ids[i];
+      }
+      pick--;
+    }
+  }
+
+  return 0;
 }
 
 static u32 aco_select_next_state(void) {
@@ -710,6 +736,8 @@ static u32 aco_select_next_state(void) {
   aco_transitions[edge_idx].traversals++;
   aco_current_state_id = aco_last_to_state_id;
 
+  if (!aco_state_selectable(aco_last_to_state_id)) return aco_fallback_state();
+
   selected_state_index = get_state_index(aco_last_to_state_id);
   return aco_last_to_state_id;
 }
@@ -720,6 +748,7 @@ static void aco_register_observed_transitions(void) {
   if (!state_count || !state_sequence) return;
 
   for (i = 1; i < state_count; i++) {
+    if (!aco_state_selectable(state_sequence[i - 1]) || !aco_state_selectable(state_sequence[i])) continue;
     aco_transition_t *transition = aco_get_transition(state_sequence[i - 1], state_sequence[i]);
     aco_refresh_transition_depth(transition);
   }
@@ -755,7 +784,7 @@ static void aco_update_from_feedback(u8 fault, u8 new_queue_entry) {
     aco_stagnation = 0;
     for (i = 0; i < state_count; i++) {
       aco_deposit_state(state_sequence[i], reward * 0.25);
-      if (i > 0) {
+      if (i > 0 && aco_state_selectable(state_sequence[i - 1]) && aco_state_selectable(state_sequence[i])) {
         aco_transition_t *transition = aco_get_transition(state_sequence[i - 1], state_sequence[i]);
         aco_refresh_transition_depth(transition);
         aco_reward_transition(transition, reward, new_code_cov, aco_last_state_new, aco_last_unique_crash);
@@ -767,8 +796,8 @@ static void aco_update_from_feedback(u8 fault, u8 new_queue_entry) {
     aco_stagnation++;
     if (selected_transition) aco_penalize_transition(selected_transition, penalty_factor);
     for (i = 1; i < state_count; i++) {
-      aco_transition_t *transition = aco_get_transition(state_sequence[i - 1], state_sequence[i]);
-      aco_penalize_transition(transition, penalty_factor);
+      u32 transition_idx = aco_find_transition(state_sequence[i - 1], state_sequence[i]);
+      if (transition_idx != aco_transition_count) aco_penalize_transition(&aco_transitions[transition_idx], penalty_factor);
     }
   }
 
@@ -1130,6 +1159,7 @@ struct queue_entry *choose_seed(u32 target_state_id, u8 mode)
         break;
     }
   } else {
+    if (state_selection_algo == ACO_SELECTION) return NULL;
     PFATAL("AFLNet - the states hashtable has no entries for state %d", target_state_id);
   }
 
