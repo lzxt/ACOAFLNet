@@ -1159,8 +1159,8 @@ struct queue_entry *choose_seed(u32 target_state_id, u8 mode)
         break;
     }
   } else {
-    if (state_selection_algo == ACO_SELECTION) return NULL;
-    PFATAL("AFLNet - the states hashtable has no entries for state %d", target_state_id);
+    WARNF("AFLNet - skipping target state %d because it has no state metadata yet", target_state_id);
+    return NULL;
   }
 
   return result;
